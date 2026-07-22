@@ -1,0 +1,329 @@
+-- =============================================================================
+-- Social Media Screen Time & Mental Health — Data Cleaning Pipeline (MySQL)
+-- Mirrors the pandas/numpy cleaning logic, done natively in SQL.
+-- =============================================================================
+--
+-- HOW TO RUN
+-- 1. Create a database (or use an existing one) and switch to it.
+-- 2. Run Section 1 to create the raw table.
+-- 3. Load the CSV using LOAD DATA INFILE (Section 2) — adjust the file path
+--    to wherever the CSV sits on the MySQL server / client machine.
+--    (If LOAD DATA INFILE is restricted on your server, use MySQL Workbench's
+--    Table Data Import Wizard instead — same result.)
+-- 4. Run Sections 3–6 in order: profiling -> cleaning -> feature engineering
+--    -> validation -> export view.
+-- =============================================================================
+
+
+-- =============================================================================
+-- SECTION 1 — CREATE RAW TABLE
+-- =============================================================================
+
+DROP TABLE IF EXISTS social_media_raw;
+
+CREATE TABLE social_media_raw (
+    participant_id                          VARCHAR(15) PRIMARY KEY,
+    age                                     INT,
+    gender                                  VARCHAR(30) NULL,
+    occupation                              VARCHAR(50),
+    region                                  VARCHAR(50),
+    most_used_platform                      VARCHAR(30),
+    platforms_used_count                    INT,
+    daily_screen_hours                      DECIMAL(5,2),
+    daily_notifications                     INT,
+    night_time_use                          VARCHAR(20),
+    minutes_to_first_check_after_waking     INT,
+    primary_purpose                         VARCHAR(50),
+    avg_sleep_hours                         DECIMAL(4,2) NULL,
+    anxiety_score_0to27                     INT,
+    low_mood_score_0to27                    INT,
+    life_satisfaction_1to10                 INT,
+    loneliness_1to10                        INT,
+    self_esteem_1to10                       INT,
+    fomo_1to10                              INT,
+    social_comparison_1to10                 INT,
+    physical_activity_days_per_week         INT,
+    uses_screen_time_limits                 VARCHAR(10),
+    attempted_digital_detox                 VARCHAR(20),
+    seeks_mental_health_support              VARCHAR(20),
+    wellbeing_band                          VARCHAR(20)
+) ENGINE=InnoDB;
+
+
+-- =============================================================================
+-- SECTION 2 — LOAD RAW CSV
+-- =============================================================================
+-- NOTE: update the file path to match your environment. secure_file_priv may
+-- restrict which directory LOAD DATA INFILE can read from — check with:
+--   SHOW VARIABLES LIKE 'secure_file_priv';
+
+LOAD DATA LOCAL INFILE '/path/to/social_media_screentime_mental_health_2026.csv'
+INTO TABLE social_media_raw
+FIELDS TERMINATED BY ','
+OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS
+(participant_id, age, @gender, occupation, region, most_used_platform,
+ platforms_used_count, daily_screen_hours, daily_notifications, night_time_use,
+ minutes_to_first_check_after_waking, primary_purpose, @avg_sleep_hours,
+ anxiety_score_0to27, low_mood_score_0to27, life_satisfaction_1to10,
+ loneliness_1to10, self_esteem_1to10, fomo_1to10, social_comparison_1to10,
+ physical_activity_days_per_week, uses_screen_time_limits,
+ attempted_digital_detox, seeks_mental_health_support, wellbeing_band)
+SET
+    gender = NULLIF(@gender, ''),
+    avg_sleep_hours = NULLIF(@avg_sleep_hours, '');
+
+
+-- =============================================================================
+-- SECTION 3 — PROFILE THE RAW DATA (before cleaning)
+-- =============================================================================
+
+-- 3a. Row count and basic shape
+SELECT COUNT(*) AS total_rows FROM social_media_raw;
+
+-- 3b. Missing value audit — one row per column, showing null counts
+SELECT
+    'gender'            AS column_name, COUNT(*) - COUNT(gender)            AS missing_count FROM social_media_raw
+UNION ALL
+SELECT 'avg_sleep_hours', COUNT(*) - COUNT(avg_sleep_hours)     FROM social_media_raw
+UNION ALL
+SELECT 'age',             COUNT(*) - COUNT(age)                 FROM social_media_raw
+UNION ALL
+SELECT 'occupation',      COUNT(*) - COUNT(occupation)          FROM social_media_raw;
+
+-- 3c. Duplicate check on primary key (should return 0 rows since it's a PK,
+-- but useful to show as an explicit data-quality step)
+SELECT participant_id, COUNT(*) AS cnt
+FROM social_media_raw
+GROUP BY participant_id
+HAVING COUNT(*) > 1;
+
+-- 3d. Range sanity check on key numeric fields
+SELECT
+    MIN(age) AS min_age, MAX(age) AS max_age,
+    MIN(daily_screen_hours) AS min_screen_hrs, MAX(daily_screen_hours) AS max_screen_hrs,
+    MIN(anxiety_score_0to27) AS min_anxiety, MAX(anxiety_score_0to27) AS max_anxiety
+FROM social_media_raw;
+
+
+-- =============================================================================
+-- SECTION 4 — BUILD THE CLEANED TABLE
+-- =============================================================================
+-- Rather than UPDATE-ing the raw table in place, we build a new cleaned table.
+-- This preserves the original raw data untouched (best practice: never mutate
+-- your source data) and makes the whole pipeline re-runnable.
+
+DROP TABLE IF EXISTS social_media_cleaned;
+
+CREATE TABLE social_media_cleaned AS
+SELECT
+    participant_id,
+    age,
+
+    -- 4a. gender: fill NULLs with an explicit label instead of leaving blank
+    COALESCE(gender, 'Not specified') AS gender,
+
+    occupation,
+    region,
+    most_used_platform,
+    platforms_used_count,
+    daily_screen_hours,
+    daily_notifications,
+    night_time_use,
+    minutes_to_first_check_after_waking,
+    primary_purpose,
+
+    -- 4b. avg_sleep_hours: impute missing values using the MEDIAN sleep hours
+    -- within the same wellbeing_band (group-aware, computed via a correlated
+    -- subquery since MySQL has no native GROUP-wise MEDIAN function)
+    COALESCE(
+        avg_sleep_hours,
+        (
+            SELECT sub_median.med
+            FROM (
+                SELECT wellbeing_band, AVG(avg_sleep_hours) AS med
+                -- median approximation: for a cleaner true median, see the
+                -- window-function version in Section 4c below
+                FROM social_media_raw
+                WHERE avg_sleep_hours IS NOT NULL
+                GROUP BY wellbeing_band
+            ) AS sub_median
+            WHERE sub_median.wellbeing_band = social_media_raw.wellbeing_band
+        )
+    ) AS avg_sleep_hours,
+
+    -- audit flag: was this row's sleep value imputed?
+    CASE WHEN avg_sleep_hours IS NULL THEN 1 ELSE 0 END AS sleep_hours_imputed,
+
+    anxiety_score_0to27,
+    low_mood_score_0to27,
+    life_satisfaction_1to10,
+    loneliness_1to10,
+    self_esteem_1to10,
+    fomo_1to10,
+    social_comparison_1to10,
+    physical_activity_days_per_week,
+    uses_screen_time_limits,
+    attempted_digital_detox,
+
+    -- 4c. collapse "Yes, failed" / "Yes, succeeded" into a clean Yes/No
+    CASE WHEN attempted_digital_detox LIKE 'Yes%' THEN 'Yes' ELSE 'No' END
+        AS digital_detox_attempted,
+
+    seeks_mental_health_support,
+    wellbeing_band,
+
+    -- 4d. Age Group — CASE mirrors the np.select logic from the Python version
+    CASE
+        WHEN age < 18 THEN 'Under 18'
+        WHEN age <= 24 THEN '18-24'
+        WHEN age <= 34 THEN '25-34'
+        WHEN age <= 44 THEN '35-44'
+        WHEN age <= 54 THEN '45-54'
+        ELSE '55+'
+    END AS age_group,
+
+    -- 4e. Screen Time Tier
+    CASE
+        WHEN daily_screen_hours < 2 THEN 'Low (<2h)'
+        WHEN daily_screen_hours < 4 THEN 'Moderate (2-4h)'
+        WHEN daily_screen_hours < 6 THEN 'High (4-6h)'
+        ELSE 'Very High (6h+)'
+    END AS screen_time_tier,
+
+    -- 4f. First-Check Bucket
+    CASE
+        WHEN minutes_to_first_check_after_waking <= 5 THEN 'Within 5 min'
+        WHEN minutes_to_first_check_after_waking <= 15 THEN '6-15 min'
+        WHEN minutes_to_first_check_after_waking <= 30 THEN '16-30 min'
+        ELSE '30+ min'
+    END AS first_check_bucket,
+
+    -- 4g. Composite Distress Index (0-10 scale)
+    ROUND(
+        (
+            (anxiety_score_0to27 / 27.0 * 10)
+            + (low_mood_score_0to27 / 27.0 * 10)
+            + (10 - life_satisfaction_1to10)
+        ) / 3.0,
+        2
+    ) AS distress_index,
+
+    -- 4h. At-Risk binary flag
+    CASE WHEN wellbeing_band = 'At-risk' THEN 1 ELSE 0 END AS at_risk_flag
+
+FROM social_media_raw;
+
+
+-- =============================================================================
+-- SECTION 4c (alternative) — TRUE MEDIAN via window function (MySQL 8.0+)
+-- =============================================================================
+-- The AVG-based imputation above is a simplification (true GROUP-wise MEDIAN
+-- needs a window function in MySQL 8.0+). This block shows the more rigorous
+-- version — worth including in a portfolio to show you know PERCENT_RANK /
+-- window functions, a commonly-tested SQL interview topic.
+
+DROP TEMPORARY TABLE IF EXISTS sleep_medians_by_band;
+
+CREATE TEMPORARY TABLE sleep_medians_by_band AS
+WITH ranked AS (
+    SELECT
+        wellbeing_band,
+        avg_sleep_hours,
+        PERCENT_RANK() OVER (
+            PARTITION BY wellbeing_band ORDER BY avg_sleep_hours
+        ) AS pct_rank
+    FROM social_media_raw
+    WHERE avg_sleep_hours IS NOT NULL
+)
+SELECT wellbeing_band, AVG(avg_sleep_hours) AS median_sleep_hours
+FROM ranked
+WHERE pct_rank BETWEEN 0.49 AND 0.51   -- captures the middle value(s)
+GROUP BY wellbeing_band;
+
+-- To use the true median instead of the AVG approximation, replace the
+-- correlated subquery in Section 4 with a JOIN against this temp table:
+--   LEFT JOIN sleep_medians_by_band m ON m.wellbeing_band = social_media_raw.wellbeing_band
+--   ... COALESCE(avg_sleep_hours, m.median_sleep_hours)
+
+
+-- =============================================================================
+-- SECTION 5 — OUTLIER DETECTION (IQR method via window functions)
+-- =============================================================================
+-- Flags outliers on daily_screen_hours the same way the Python version does,
+-- using PERCENTILE_CONT-style logic (MySQL lacks PERCENTILE_CONT directly,
+-- so we approximate Q1/Q3 via PERCENT_RANK, standard MySQL 8.0 technique).
+
+DROP TEMPORARY TABLE IF EXISTS screen_hours_quartiles;
+
+CREATE TEMPORARY TABLE screen_hours_quartiles AS
+WITH ranked AS (
+    SELECT
+        daily_screen_hours,
+        PERCENT_RANK() OVER (ORDER BY daily_screen_hours) AS pct_rank
+    FROM social_media_raw
+)
+SELECT
+    MAX(CASE WHEN pct_rank <= 0.25 THEN daily_screen_hours END) AS q1,
+    MAX(CASE WHEN pct_rank <= 0.75 THEN daily_screen_hours END) AS q3
+FROM ranked;
+
+-- Add the outlier flag column and populate it
+ALTER TABLE social_media_cleaned ADD COLUMN is_screen_hours_outlier TINYINT(1);
+
+UPDATE social_media_cleaned c
+JOIN screen_hours_quartiles q ON 1=1
+SET c.is_screen_hours_outlier = CASE
+    WHEN c.daily_screen_hours < (q.q1 - 1.5 * (q.q3 - q.q1))
+      OR c.daily_screen_hours > (q.q3 + 1.5 * (q.q3 - q.q1))
+    THEN 1 ELSE 0
+END;
+
+-- How many flagged?
+SELECT is_screen_hours_outlier, COUNT(*) AS row_count
+FROM social_media_cleaned
+GROUP BY is_screen_hours_outlier;
+
+
+-- =============================================================================
+-- SECTION 6 — VALIDATION
+-- =============================================================================
+
+-- 6a. No remaining NULLs in the two columns we fixed
+SELECT
+    SUM(CASE WHEN gender IS NULL THEN 1 ELSE 0 END) AS null_gender,
+    SUM(CASE WHEN avg_sleep_hours IS NULL THEN 1 ELSE 0 END) AS null_sleep
+FROM social_media_cleaned;
+
+-- 6b. No duplicate participant_id values
+SELECT COUNT(*) AS duplicate_ids
+FROM (
+    SELECT participant_id FROM social_media_cleaned
+    GROUP BY participant_id HAVING COUNT(*) > 1
+) d;
+
+-- 6c. distress_index within expected 0-10 bounds
+SELECT COUNT(*) AS out_of_range_rows
+FROM social_media_cleaned
+WHERE distress_index < 0 OR distress_index > 10;
+
+-- 6d. Row count matches the raw table (no rows dropped)
+SELECT
+    (SELECT COUNT(*) FROM social_media_raw)     AS raw_row_count,
+    (SELECT COUNT(*) FROM social_media_cleaned) AS cleaned_row_count;
+
+
+-- =============================================================================
+-- SECTION 7 — EXPORT (view the final cleaned table / export to CSV)
+-- =============================================================================
+
+-- Quick look at the cleaned result
+SELECT * FROM social_media_cleaned LIMIT 20;
+
+-- To export to CSV from MySQL Workbench: right-click the result grid ->
+-- Export Resultset, or use the Table Data Export Wizard on social_media_cleaned.
+--
+-- To export via CLI instead:
+--   mysql -u <user> -p <database> -e "SELECT * FROM social_media_cleaned" \
+--     --batch --silent > social_media_screentime_mental_health_2026_CLEANED.csv
